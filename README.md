@@ -58,6 +58,7 @@ flowchart TD
 mkdir -p "$HOME/.local/bin"
 cp bin/aih bin/ai-history-claude bin/ai-history-codex bin/ai_history_common.py "$HOME/.local/bin/"
 chmod 700 "$HOME/.local/bin/aih" "$HOME/.local/bin/ai-history-claude" "$HOME/.local/bin/ai-history-codex"
+chmod 600 "$HOME/.local/bin/ai_history_common.py"
 ```
 
 `~/.local/bin`을 PATH에 추가하고 `python3 --version`이 3.9 이상인지 확인합니다. 훅 프로세스에서도 Python을 찾을 수 있어야 합니다. 필요하면 설정의 `python3`를 해당 환경의 절대 경로로 지정하세요.
