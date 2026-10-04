@@ -2,24 +2,53 @@
 
 Claude Code와 Codex에서 사람이 나눈 **프롬프트와 최종 답변 원문**을 같은 형식으로 저장하고 검색하는 로컬 도구입니다.
 
-Python 3.9 이상 표준 라이브러리만 사용합니다. 별도 DB·서버·LLM API 호출이 없습니다. macOS에서 검증했으며 다른 운영체제는 아직 검증하지 않았습니다.
+Python 3.9 이상 표준 라이브러리만 사용합니다. 별도 DB·서버·LLM API 호출이나 외부 전송이 없습니다. macOS에서 검증했으며 다른 운영체제는 아직 검증하지 않았습니다.
 
-## 구조
+## 기록 흐름
 
-```text
-bin/
-  aih                     대화 블록 검색
-  ai-history-claude       Claude 훅 수집기
-  ai-history-codex        Codex 훅 수집기와 과거 변환 엔진
-  ai_history_common.py   공유 잠금·저장·중복 방지·복구
-scripts/
-  backfill_claude.py      Claude 원본 JSONL 가져오기
-  backfill_codex.py       Codex 원본 JSONL 가져오기
-examples/                개인 설정을 포함하지 않은 훅 설정 예시
-tests/                   임시 합성 데이터를 사용하는 회귀 테스트
+```mermaid
+flowchart TD
+    A[Claude Code 훅] --> C[Claude 수집기]
+    B[Codex 훅] --> D[Codex 수집기]
+    C --> E[이벤트 큐 · 프롬프트 버퍼]
+    D --> E
+    E --> F[공통 저장 계층]
+    G[과거 JSONL 기록] --> H[도구별 과거 변환기]
+    H --> F
+    F --> I[날짜별 Markdown]
+    I --> J[aih 검색 · 조회]
 ```
 
-훅 입력 JSON → 도구별 필터 → 이벤트 큐·프롬프트 버퍼 → 공통 저장 계층 → 날짜별 Markdown → `aih` 순서로 동작합니다.
+수집기는 도구별 입력 형식과 기록 대상을 판별하고, 받은 이벤트를 먼저 파일에 보관합니다. 공통 저장 계층은 양쪽 도구의 동시 쓰기, 중복 방지, 실패 복구를 담당합니다. 실시간 대화와 과거 기록 모두 같은 Markdown 형식으로 저장하므로 `aih`에서 함께 검색할 수 있습니다.
+
+## 구성 요소
+
+| 구성 요소 | 파일 | 역할 |
+|---|---|---|
+| Claude 수집기 | [bin/ai-history-claude](bin/ai-history-claude) | 질문·완료·종료 이벤트 수집, SDK 실행 제외 |
+| Codex 수집기 | [bin/ai-history-codex](bin/ai-history-codex) | 질문·완료·중단·종료 수집, 세션 출처 확인, 과거 변환 엔진 |
+| 공통 저장 모듈 | [bin/ai_history_common.py](bin/ai_history_common.py) | 기록 형식, 공유 잠금, 완료 식별자, 트랜잭션 복구 |
+| 검색 명령 | [bin/aih](bin/aih) | 키워드·프로젝트·날짜·도구별 대화 블록 검색 |
+| Claude 과거 변환기 | [scripts/backfill_claude.py](scripts/backfill_claude.py) | 원본 JSONL의 사용자 UUID와 최종 답변을 연결해 가져오기 |
+| Codex 과거 변환기 | [scripts/backfill_codex.py](scripts/backfill_codex.py) | Codex 수집기의 과거 변환 기능 실행 |
+
+[examples/](examples/)에는 개인 설정을 포함하지 않은 훅 설정 예시가 있고, [tests/](tests/)에는 임시 합성 데이터를 사용하는 회귀 테스트가 있습니다.
+
+## 기술 스택
+
+| 영역 | 구현 |
+|---|---|
+| 언어·의존성 | Python 3.9 이상, 표준 라이브러리만 사용 |
+| 도구 연동 | 명령 실행 훅이 전달하는 stdin JSON |
+| 과거 기록 입력 | Claude Code·Codex의 원본 JSONL |
+| 대화·내부 상태 저장 | 날짜별 Markdown, JSON 이벤트 큐·진행 상태·완료 식별자 |
+| 동시 쓰기 | 양쪽 수집기가 공유하는 `.lock` 디렉터리 생성으로 잠금 획득 |
+| 실패 복구 | 트랜잭션 파일, `fsync`, `os.replace`를 이용한 상태 저장 |
+| 중복 방지 | 세션·턴 식별자와 SHA-256 기반 키; Claude는 확인 가능한 원본 UUID와 연결 |
+| 검색 | 정규식으로 블록 경계를 구분하고 문자열 조건으로 검색 |
+| 테스트·CI | `unittest`, 임시 디렉터리, subprocess·동시 실행, GitHub Actions |
+
+디렉터리별 실제 데이터의 역할은 아래 [저장 형식](#저장-형식), 재시도와 복구 동작은 [검증과 복구](#검증과-복구)를 참고하세요.
 
 ## 설치
 
