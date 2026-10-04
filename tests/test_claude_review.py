@@ -162,9 +162,11 @@ class ClaudeReview(unittest.TestCase):
     def test_transcript_uuid_connects_live_and_backfill(self):
         path=self.fixture(prompt='linked')
         entries=[json.loads(line) for line in path.read_text().splitlines()]
+        # UserPromptSubmit runs before the new user entry is recorded. Creating
+        # the timestamp before the subprocess made this fail across a second boundary.
+        self.hook('UserPromptSubmit',prompt='linked',transcript_path=str(path))
         entries[0]['timestamp']=datetime.datetime.now(datetime.timezone.utc).isoformat()
         path.write_text(''.join(json.dumps(e)+'\n' for e in entries))
-        self.hook('UserPromptSubmit',prompt='linked',transcript_path=str(path))
         self.hook('Stop',last_assistant_message='final\n\n',transcript_path=str(path))
         result=self.backfill(True)
         self.assertEqual(result.returncode,0,result.stderr)
