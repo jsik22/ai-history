@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.env
+.env.*
+!.env.example
+
+# Conversation archives and runtime state never belong in source control.
+.ai_history/
+.claude/
+.codex/
+.pending/
+.claude-state/
+.codex-state/
+.codex-diagnostics/
+.lock/
+.errors
+.backfill
+history/
+backups/
+before/
+*.jsonl
+20[0-9][0-9]-[01][0-9]/

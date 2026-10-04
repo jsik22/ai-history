@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Quiet Claude hooks: persist events before serializing all state transitions."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import sys
+import time
+import uuid
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ai_history_common import Archive, atomic, key, local_timestamp
+
+
+def load(path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+
+def log(root, message):
+    try:
+        with (root / '.errors').open('a', encoding='utf-8') as out:
+            out.write(f'{local_timestamp()} claude {message}\n')
+    except OSError:
+        pass
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def answer_of(event, root):
+    if 'last_assistant_message' not in event:
+        log(root, 'Stop without last_assistant_message')
+        return '(답변 필드 없음 - 훅 형식 변경 확인 필요)'
+    answer = event['last_assistant_message']
+    if answer is None or answer == '':
+        return '(텍스트 답변 없음)'
+    if not isinstance(answer, str):
+        raise ValueError('last_assistant_message must be a string or null')
+    return answer
+
+
+def legacy_pending(archive, sid):
+    path = archive.root / '.pending' / ('claude-' + sid)
+    if not path.is_dir():
+        return None, None
+    def field(name):
+        text = (path / name).read_text(encoding='utf-8')
+        return text[:-1] if text.endswith('\n') else text
+    row = dict(sid=sid, ts=field('ts'), cwd=field('cwd'), prompt=field('prompt'))
+    row['tid'] = 'legacy-' + fingerprint(row)
+    return row, path
+
+
+def transcript_identity(event, pending, state):
+    path = event.get('transcript_path')
+    if not path:
+        return None
+    latest = None
+    try:
+        with open(path, encoding='utf-8') as source:
+            for line in source:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if (entry.get('type') == 'user' and entry.get('uuid')
+                        and not entry.get('isMeta') and not entry.get('isSidechain')):
+                    content = entry.get('message', {}).get('content')
+                    if isinstance(content, list):
+                        if any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in content):
+                            continue
+                        content = '\n'.join(b.get('text', '') for b in content
+                                            if isinstance(b, dict) and b.get('type') == 'text')
+                    latest = (entry, content)
+        if latest:
+            entry, content = latest
+            if (content == pending['prompt'] and entry.get('sessionId') == pending['sid']
+                    and entry['uuid'] != state.get('last_user_uuid')
+                    and local_timestamp(entry['timestamp']) >= pending['ts']):
+                return entry['uuid']
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def process(archive, event):
+    sid = event['session_id']
+    state_path = archive.state / ('session-' + key(sid, 'session') + '.json')
+    state = load(state_path, {})
+    pending_path = archive.pending / (key(sid, 'session') + '.json')
+    pending = load(pending_path)
+    legacy = None
+    if pending is None:
+        pending, legacy = legacy_pending(archive, sid)
+    finished = False
+
+    def finish(answer):
+        nonlocal pending, finished
+        if pending is None:
+            return
+        archive.commit(dict(pending, answer=answer))
+        finished = True
+        pending = None
+
+    kind = event['hook_event_name']
+    if kind == 'UserPromptSubmit':
+        if pending is not None and pending.get('event_id') == event['_id']:
+            return
+        finish('(이 턴의 답변 기록 없음)')
+        # Same text submitted again is still a distinct human turn.
+        pending = dict(sid=sid, tid=event['_id'], event_id=event['_id'],
+                       ts=event['_ts'], cwd=event.get('cwd', ''), prompt=event['prompt'])
+        atomic(pending_path, pending)
+        state['active'] = event['_id']
+        state.pop('last_stop', None)
+    elif kind == 'Stop':
+        answer = answer_of(event, archive.root)
+        stop_key = fingerprint([event.get('transcript_path'), answer])
+        if pending is not None:
+            identity = pending.get('transcript_uuid') or transcript_identity(event, pending, state)
+            if identity:
+                pending['tid'] = identity
+                pending['transcript_uuid'] = identity
+                atomic(pending_path, pending)
+                state['last_user_uuid'] = identity
+            finish(answer)
+        elif state.get('last_stop') == stop_key:
+            return
+        else:
+            archive.commit(dict(sid=sid, tid=event['_id'], ts=event['_ts'],
+                                cwd=event.get('cwd', ''), prompt=None, answer=answer))
+        state['last_stop'] = stop_key
+        state.pop('active', None)
+    elif kind == 'SessionEnd':
+        finish('(이 턴의 답변 기록 없음)')
+        state.pop('active', None)
+    atomic(state_path, state)
+    if finished:
+        if kind != 'UserPromptSubmit':
+            pending_path.unlink(missing_ok=True)
+        if legacy is not None:
+            for name in ('ts', 'cwd', 'prompt'):
+                (legacy / name).unlink(missing_ok=True)
+            try:
+                legacy.rmdir()
+            except OSError:
+                pass
+
+
+def drain(archive):
+    with archive.locked():
+        for path in sorted(archive.queue.glob('*.json')):
+            process(archive, load(path))
+            path.unlink()
+
+
+def main():
+    os.umask(0o077)
+    def interrupted(signum, frame):
+        raise SystemExit('hook interrupted; queued event retained')
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, interrupted)
+    root = Path(os.environ.get('AI_HISTORY_DIR', str(Path.home() / '.ai_history')))
+    try:
+        if os.environ.get('CLAUDE_CODE_ENTRYPOINT', '').startswith('sdk'):
+            return
+        event = json.load(sys.stdin)
+        if not isinstance(event, dict):
+            return
+        sid = event.get('session_id')
+        if not isinstance(sid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', sid):
+            raise ValueError('invalid session_id')
+        if event.get('hook_event_name') not in ('UserPromptSubmit', 'Stop', 'SessionEnd'):
+            return
+        if event['hook_event_name'] == 'UserPromptSubmit' and not isinstance(event.get('prompt'), str):
+            raise ValueError('prompt must be a string')
+        if not isinstance(event.get('cwd', ''), str):
+            raise ValueError('cwd must be a string')
+        if event['hook_event_name'] == 'Stop':
+            answer = event.get('last_assistant_message')
+            if answer is not None and not isinstance(answer, str):
+                raise ValueError('last_assistant_message must be a string or null')
+        archive = Archive(root, 'claude')
+        archive.setup()
+        event['_id'] = uuid.uuid4().hex
+        event['_ts'] = local_timestamp()
+        atomic(archive.queue / (f'{time.time_ns():020d}-' + event['_id'] + '.json'), event)
+        drain(archive)
+    except BaseException as exc:
+        log(root, str(exc))
+
+
+if __name__ == '__main__':
+    main()

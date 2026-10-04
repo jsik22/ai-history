@@ -1,0 +1,12 @@
+# Merge these event groups into the existing user config; preserve notify and hooks.state.
+[[hooks.UserPromptSubmit]]
+hooks = [{ type = "command", command = 'python3 "$HOME/.local/bin/ai-history-codex"', timeout = 5 }]
+
+[[hooks.Stop]]
+hooks = [{ type = "command", command = 'python3 "$HOME/.local/bin/ai-history-codex"', timeout = 10 }]
+
+[[hooks.Interrupt]]
+hooks = [{ type = "command", command = 'python3 "$HOME/.local/bin/ai-history-codex"', timeout = 3 }]
+
+[[hooks.SessionEnd]]
+hooks = [{ type = "command", command = 'python3 "$HOME/.local/bin/ai-history-codex"', timeout = 3 }]

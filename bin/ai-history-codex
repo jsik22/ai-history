@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Private raw conversation archive: silent hooks; explicit --backfill command."""
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import os
+import signal
+from pathlib import Path
+import sys
+import time
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ai_history_common import Archive
+
+os.umask(0o077)
+
+def terminate(signum, frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, terminate)
+signal.signal(signal.SIGHUP, terminate)
+ROOT = Path(os.environ.get('AI_HISTORY_DIR', str(Path.home() / '.ai_history')))
+SESSIONS = Path(os.environ.get('AI_HISTORY_CODEX_SESSIONS', str(Path.home() / '.codex/sessions')))
+STATE = ROOT / '.codex-state'
+PENDING = ROOT / '.pending/codex'
+QUEUE = ROOT / '.pending/codex-events'
+EMPTY = '(텍스트 답변 없음)'
+INTERRUPTED = '(중단됨)'
+UNANSWERED = '(이 턴의 답변 기록 없음)'
+MISSING = '(답변 필드 없음 - 훅 형식 변경 확인 필요)'
+DEADLINE = None
+
+def check_deadline():
+    if DEADLINE is not None and time.monotonic() >= DEADLINE:
+        raise TimeoutError('hook work budget exhausted; event retained')
+
+def archive():
+    return Archive(ROOT, 'codex')
+
+def setup():
+    archive().setup()
+
+def error(message):
+    with (ROOT / '.errors').open('a', encoding='utf-8') as f:
+        f.write(f'{dt.datetime.now().isoformat()} codex {message}\n')
+
+def atomic(path, value):
+    temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with temp.open('x', encoding='utf-8') as f:
+            json.dump(value, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+def read(path):
+    return json.loads(path.read_text(encoding='utf-8'))
+
+def key(sid, tid):
+    if not isinstance(sid, str) or not sid or not isinstance(tid, str) or not tid:
+        raise ValueError('missing session_id/turn_id; event retained')
+    return hashlib.sha256((sid + '\0' + tid).encode()).hexdigest()
+
+def local_timestamp(value):
+    return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d %H:%M:%S')
+
+def block(row):
+    cwd = row['cwd']
+    home = str(Path.home())
+    if cwd == home or cwd.startswith(home + '/'):
+        cwd = '~' + cwd[len(home):]
+    prompt = row.get('prompt')
+    prompt = '(이어서)' if prompt is None else prompt
+    quoted = '\n'.join('> ' + line for line in prompt.split('\n'))
+    return (f"===== {row['ts']} | codex | {cwd} | s:{row['sid'][:8]} =====\n"
+            + quoted + '\n' + row['answer'] + '\n\n').encode('utf-8')
+
+@contextlib.contextmanager
+def locked(timeout=2.0):
+    if DEADLINE is not None:
+        timeout = min(timeout, max(0, DEADLINE - time.monotonic()))
+    with archive().locked(timeout=timeout):
+        yield
+
+def recover():
+    archive().recover()
+
+def commit(row):
+    check_deadline()
+    fresh = archive().commit(row)
+    (PENDING / key(row['sid'], row['tid'])).unlink(missing_ok=True)
+    if fresh and row['answer'] == MISSING:
+        error(f"missing final answer field sid={row['sid']} turn={row['tid']}")
+    return fresh
+
+def metadata(path):
+    with path.open(encoding='utf-8') as f:
+        first = json.loads(next(f))
+    if first.get('type') != 'session_meta':
+        raise ValueError('transcript lacks session_meta')
+    return first['payload']
+
+def allowed(meta):
+    return meta.get('originator') == 'codex-tui' and meta.get('source') in ('cli', 'vscode')
+
+def transcript(event):
+    sid = event['session_id']
+    candidate = event.get('transcript_path')
+    paths = [Path(candidate)] if candidate else SESSIONS.rglob('*.jsonl')
+    for path in paths:
+        check_deadline()
+        if not path.resolve().is_relative_to(SESSIONS.resolve()):
+            raise ValueError('transcript outside sessions directory')
+        if not candidate and sid not in path.name:
+            continue
+        meta = metadata(path)
+        if meta.get('id') == sid:
+            return path, meta
+    raise ValueError('session metadata unavailable; event retained')
+
+def rows_from_transcript(path, meta):
+    rows = {}
+    cwd = meta.get('cwd', '')
+    with path.open(encoding='utf-8') as f:
+        for line in f:
+            check_deadline()
+            try:
+                x = json.loads(line)
+            except ValueError:
+                # The live writer can still be appending its last line.
+                if not line.endswith('\n'):
+                    break
+                raise
+            y = x.get('payload', {})
+            if x.get('type') == 'turn_context':
+                cwd = y.get('cwd', cwd)
+            if x.get('type') != 'event_msg':
+                continue
+            tid = y.get('turn_id')
+            if not tid:
+                continue
+            event = y.get('type')
+            item = y.get('item', {})
+            if event not in ('task_started', 'task_complete', 'turn_aborted') and item.get('type') != 'UserMessage':
+                continue
+            row = rows.setdefault(tid, {'sid': meta['id'], 'tid': tid,
+                'ts': local_timestamp(x['timestamp']), 'cwd': cwd, 'prompt': None, 'items': []})
+            if item.get('type') == 'UserMessage':
+                item_id = item.get('id')
+                if item_id and item_id in row['items']:
+                    continue
+                if row['prompt'] is None:
+                    row['ts'] = local_timestamp(x['timestamp'])
+                    row['cwd'] = cwd
+                    row['prompt'] = ''
+                else:
+                    row['prompt'] += '\n'
+                row['prompt'] += '\n'.join(c['text'] for c in item.get('content', []) if isinstance(c.get('text'), str))
+                if item_id:
+                    row['items'].append(item_id)
+            if event == 'task_complete':
+                row['answer'] = (y.get('last_agent_message') or EMPTY) if 'last_agent_message' in y else MISSING
+            elif event == 'turn_aborted':
+                row['answer'] = INTERRUPTED
+    return rows
+
+def process(envelope):
+    event = envelope['input']
+    name = event.get('hook_event_name')
+    if name not in ('UserPromptSubmit', 'Stop', 'Interrupt', 'SessionEnd'):
+        return
+    path, meta = transcript(event)
+    if not allowed(meta):
+        return
+    sid = event['session_id']
+    if name == 'SessionEnd':
+        # Include final transcript state, including any steering messages.
+        rows = rows_from_transcript(path, meta)
+        for pending in list(PENDING.iterdir()):
+            check_deadline()
+            if pending.name.endswith('.tmp'):
+                continue
+            row = read(pending)
+            if row['sid'] != sid:
+                continue
+            actual = rows.get(row['tid'])
+            if actual and actual['prompt'] is not None:
+                row.update(actual)
+            row.setdefault('answer', UNANSWERED)
+            commit(row)
+        return
+    tid = event.get('turn_id')
+    ident = key(sid, tid)
+    pending = PENDING / ident
+    if (STATE / 'done' / ident).exists():
+        return
+    row = read(pending) if pending.exists() else {
+        'sid': sid, 'tid': tid, 'ts': local_timestamp(envelope['observed_at']),
+        'cwd': event.get('cwd', meta.get('cwd', '')), 'prompt': None,
+    }
+    if name == 'UserPromptSubmit':
+        if row['prompt'] is None:
+            row['prompt'] = event['prompt']
+        # The transcript is authoritative for repeated/retried/steered messages.
+        atomic(pending, row)
+        return
+    actual = rows_from_transcript(path, meta).get(tid)
+    if actual and actual['prompt'] is not None:
+        row.update(actual)
+    if name == 'Interrupt':
+        row['answer'] = INTERRUPTED
+    elif 'last_assistant_message' not in event:
+        row['answer'] = MISSING
+        error(f'Stop without last_assistant_message sid={sid} turn={tid}')
+    else:
+        row['answer'] = event['last_assistant_message'] or EMPTY
+    commit(row)
+
+def drain(budget=None):
+    global DEADLINE
+    previous = DEADLINE
+    DEADLINE = time.monotonic() + budget if budget is not None else None
+    try:
+        with locked():
+            recover()
+            blocked = set()
+            for path in sorted(QUEUE.glob('*.json')):
+                check_deadline()
+                sid = None
+                try:
+                    envelope = read(path)
+                    sid = envelope['input'].get('session_id')
+                    if sid in blocked:
+                        continue
+                    process(envelope)
+                    path.unlink()
+                except Exception as exc:
+                    if sid is not None:
+                        blocked.add(sid)
+                    error(f'{type(exc).__name__}: {exc}; queued={path.name}')
+                    # An unresolved append must be recovered before another writer.
+                    if (STATE / 'transaction.json').exists() or isinstance(exc, TimeoutError):
+                        break
+    finally:
+        DEADLINE = previous
+
+def hook():
+    envelope = {'observed_at': dt.datetime.now().astimezone().isoformat(), 'input': json.load(sys.stdin)}
+    atomic(QUEUE / (str(time.time_ns()) + '-' + uuid.uuid4().hex + '.json'), envelope)
+    drain(budget=2.5)
+
+def backfill(apply):
+    counts = {'sessions': 0, 'excluded_sessions': 0, 'new_turns': 0, 'already_recorded': 0,
+              'open_turns': 0, 'errors': 0}
+    batch = []
+    for path in sorted(SESSIONS.rglob('*.jsonl')):
+        try:
+            meta = metadata(path)
+            if not allowed(meta):
+                counts['excluded_sessions'] += 1
+                continue
+            counts['sessions'] += 1
+            rows = list(rows_from_transcript(path, meta).values())
+            for i, row in enumerate(rows):
+                if row['prompt'] is None and 'answer' not in row:
+                    continue
+                if 'answer' not in row:
+                    # Another turn can start while an earlier turn is still live.
+                    # Only an actual terminal event or SessionEnd may finalize it.
+                    counts['open_turns'] += 1
+                    continue
+                batch.append(row)
+        except (OSError, ValueError, StopIteration) as exc:
+            counts['errors'] += 1
+            if apply:
+                error(f'backfill {path.name}: {type(exc).__name__}')
+    for row in sorted(batch, key=lambda r: (r['ts'], r['sid'], r['tid'])):
+        ident = key(row['sid'], row['tid'])
+        if apply:
+            with locked():
+                recover()
+                fresh = commit(row)
+        else:
+            fresh = not (STATE / 'done' / ident).exists()
+        counts['new_turns' if fresh else 'already_recorded'] += 1
+    if apply:
+        with locked():
+            with (ROOT / '.backfill').open('a', encoding='utf-8') as f:
+                f.write('codex backfill: ' + dt.datetime.now().astimezone().isoformat() + ' ' + json.dumps(counts) + '\n')
+    print(json.dumps(counts, ensure_ascii=False))
+
+if __name__ == '__main__':
+    if '--drain' in sys.argv:
+        try:
+            setup()
+            drain()
+            remaining = len(list(QUEUE.glob('*.json')))
+            print(json.dumps({'remaining_events': remaining}))
+            sys.exit(1 if remaining else 0)
+        except Exception as exc:
+            print(f'Codex queue recovery failed: {type(exc).__name__}', file=sys.stderr)
+            sys.exit(1)
+    elif '--backfill' in sys.argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--backfill', action='store_true')
+        parser.add_argument('--apply', action='store_true')
+        args = parser.parse_args()
+        if args.apply:
+            setup()
+        backfill(args.apply)
+    else:
+        try:
+            setup()
+            hook()
+        except BaseException as exc:
+            try:
+                error(f'{type(exc).__name__}: {exc}')
+            except BaseException:
+                pass
+        sys.exit(0)
