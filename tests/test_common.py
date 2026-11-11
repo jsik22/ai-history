@@ -4,6 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lock_helper import hold, release, is_held
 
 SOURCE = Path(__file__).resolve().parents[1] / 'bin/ai_history_common.py'
 spec = importlib.util.spec_from_file_location('archive_common_tests', SOURCE)
@@ -89,12 +92,28 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.blocks().count(b'===== 2026'), 1)
 
     def test_foreign_lock_preserved(self):
-        lock = self.root / '.lock'
-        lock.mkdir()
-        with self.assertRaises(TimeoutError):
-            with self.codex.locked(timeout=.02):
-                self.fail('must not enter without owning lock')
-        self.assertTrue(lock.exists())
+        holder = hold(self.root)
+        try:
+            with self.assertRaises(TimeoutError):
+                with self.codex.locked(timeout=.02):
+                    self.fail('must not enter without owning lock')
+            self.assertTrue(is_held(self.root))
+        finally:
+            release(holder)
+
+    def test_dead_holder_lock_reclaimed(self):
+        # The kernel releases flock when the owner dies, so no stale lock can survive a SIGKILL.
+        holder = hold(self.root)
+        holder.kill(); holder.wait(); holder.stdout.close(); holder.stdin.close()
+        with self.codex.locked(timeout=.5):
+            pass
+
+    def test_legacy_lock_directory_removed(self):
+        # An orphaned mkdir-style lock from an older version must not block forever.
+        (self.root / '.lock').mkdir()
+        with self.codex.locked(timeout=.5):
+            pass
+        self.assertFalse((self.root / '.lock').exists())
 
     def test_raw_whitespace_and_private_permissions(self):
         row = self.row(answer='a\n\n')

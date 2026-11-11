@@ -27,6 +27,8 @@ SESSIONS = Path(os.environ.get('AI_HISTORY_CODEX_SESSIONS', str(Path.home() / '.
 STATE = ROOT / '.codex-state'
 PENDING = ROOT / '.pending/codex'
 QUEUE = ROOT / '.pending/codex-events'
+DROPPED = ROOT / '.pending/codex-dropped'
+ORPHAN_AGE = dt.timedelta(hours=24)
 EMPTY = '(텍스트 답변 없음)'
 INTERRUPTED = '(중단됨)'
 UNANSWERED = '(이 턴의 답변 기록 없음)'
@@ -221,6 +223,17 @@ def process(envelope):
         row['answer'] = event['last_assistant_message'] or EMPTY
     commit(row)
 
+def orphan(path, exc):
+    """Codex 가 대본을 남기지 않는 세션(내부 자동 세션 등)의 이벤트는 재시도해도 영원히 실패한다."""
+    if not (isinstance(exc, ValueError) and 'session metadata unavailable' in str(exc)):
+        return False
+    try:
+        observed = dt.datetime.fromisoformat(read(path)['observed_at'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return dt.datetime.now().astimezone() - observed >= ORPHAN_AGE
+
+
 def drain(budget=None):
     global DEADLINE
     previous = DEADLINE
@@ -240,6 +253,11 @@ def drain(budget=None):
                     process(envelope)
                     path.unlink()
                 except Exception as exc:
+                    if orphan(path, exc):
+                        DROPPED.mkdir(mode=0o700, exist_ok=True)
+                        path.rename(DROPPED / path.name)
+                        error(f'dropped orphan event (no transcript after {ORPHAN_AGE}): {path.name}')
+                        continue
                     if sid is not None:
                         blocked.add(sid)
                     error(f'{type(exc).__name__}: {exc}; queued={path.name}')

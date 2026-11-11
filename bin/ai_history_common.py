@@ -1,6 +1,8 @@
 """Shared local archive storage; callers hold locked() around state transitions."""
 import contextlib
 import datetime as dt
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -92,21 +94,31 @@ class Archive:
 
     @contextlib.contextmanager
     def locked(self, timeout=2.0):
-        lock = self.root / '.lock'
-        deadline = time.monotonic() + timeout
-        while True:
+        # Kernel advisory lock: released automatically however the holder dies,
+        # so a killed hook can never leave a stale lock behind.
+        stale = self.root / '.lock'
+        if stale.is_dir():
             try:
-                lock.mkdir(mode=0o700)
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('shared history lock timeout; event retained')
-                time.sleep(min(.05, max(0, deadline - time.monotonic())))
+                stale.rmdir()
+            except OSError:
+                pass
+        fd = os.open(self.root / '.lockfile', os.O_RDWR | os.O_CREAT, 0o600)
         try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('shared history lock timeout; event retained')
+                    time.sleep(min(.05, max(0, deadline - time.monotonic())))
             self.recover_all()
             yield
         finally:
-            lock.rmdir()
+            os.close(fd)
 
     def recover(self):
         journal = self.state / 'transaction.json'

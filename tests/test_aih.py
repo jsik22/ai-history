@@ -61,6 +61,23 @@ class AihTests(unittest.TestCase):
     def test_list(self):
         self.good(['-t', 'claude', '-l'], '\n'.join(self.second.split('\n')[:2]) + '\n')
 
+    def test_health_warns_about_stale_queue_and_recent_errors(self):
+        stale = self.root / '.pending/claude-events/1-stale.json'
+        self.write('.pending/claude-events/1-stale.json', '{}')
+        old = (datetime.datetime.now() - datetime.timedelta(days=1)).timestamp()
+        os.utime(stale, (old, old))
+        self.write('.errors', datetime.datetime.now().isoformat() + ' claude shared history lock timeout; event retained\n')
+        result = self.query('-d', '2001')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, self.first + self.second + self.third)
+        self.assertIn('claude 기록 큐에 1건', result.stderr)
+        self.assertIn('훅 오류 1건', result.stderr)
+
+    def test_health_silent_for_fresh_queue_and_old_errors(self):
+        self.write('.pending/claude-events/1-fresh.json', '{}')
+        self.write('.errors', '2001-01-01T00:00:00 claude old\n')
+        self.good(['-d', '2001'], self.first + self.second + self.third)
+
     def test_bad_arguments(self):
         for args in [('-n', '1.5'), ('-n', 'abc'), ('-n', '-1'), ('-n',), ('-z',), ('-p',), ('-t', 'unknown')]:
             with self.subTest(args=args):

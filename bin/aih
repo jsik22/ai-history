@@ -30,6 +30,34 @@ def blocks(path):
         yield ''.join(current)
 
 
+def health(root, stale_minutes=10, error_hours=24):
+    """기록 훅이 조용히 실패하고 있으면 결과 앞에 경고한다 (stderr)."""
+    now = datetime.datetime.now()
+    for tool in ('claude', 'codex'):
+        queue = root / '.pending' / (tool + '-events')
+        try:
+            ages = [now - datetime.datetime.fromtimestamp(p.stat().st_mtime)
+                    for p in queue.glob('*.json')]
+        except OSError:
+            continue
+        stale = [a for a in ages if a >= datetime.timedelta(minutes=stale_minutes)]
+        if stale:
+            oldest = max(stale)
+            print(f'aih: 경고 — {tool} 기록 큐에 {len(stale)}건이 {oldest.days}일 '
+                  f'{oldest.seconds // 3600}시간째 대기 중. 훅이 기록을 못 쓰고 있다. '
+                  f'{root / ".errors"} 확인', file=sys.stderr)
+    errors = root / '.errors'
+    try:
+        since = (now - datetime.timedelta(hours=error_hours)).strftime('%Y-%m-%dT%H:%M:%S')
+        recent = [line for line in errors.read_text(encoding='utf-8').splitlines()
+                  if line[:19].replace(' ', 'T') >= since]
+    except OSError:
+        recent = []
+    if recent:
+        print(f'aih: 최근 {error_hours}시간 훅 오류 {len(recent)}건. 마지막: {recent[-1]}',
+              file=sys.stderr)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description='일치하는 대화 블록을 출력합니다. 인자가 없으면 오늘 기록을 출력합니다.')
@@ -43,6 +71,7 @@ def main(argv=None):
     if not args.keywords and not (args.p or args.d or args.t) and args.n == 0:
         args.d = datetime.date.today().isoformat()
     root = Path(os.environ.get('AI_HISTORY_DIR') or str(Path.home() / '.ai_history'))
+    health(root)
     keywords = [word.lower() for word in args.keywords]
     matches = []
     paths = []

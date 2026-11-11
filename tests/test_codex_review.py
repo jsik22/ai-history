@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'bin/ai-history-codex'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lock_helper import hold, release, is_held
 
 
 class CodexReviewTests(unittest.TestCase):
@@ -31,6 +33,7 @@ class CodexReviewTests(unittest.TestCase):
         self.m.STATE = self.root / '.codex-state'
         self.m.PENDING = self.root / '.pending/codex'
         self.m.QUEUE = self.root / '.pending/codex-events'
+        self.m.DROPPED = self.root / '.pending/codex-dropped'
         self.m.setup()
         self.meta = {'id': '12345678-session', 'originator': 'codex-tui', 'source': 'cli', 'cwd': str(Path.home())}
         self.path = self.sessions / 'rollout-12345678-session.jsonl'
@@ -120,15 +123,14 @@ class CodexReviewTests(unittest.TestCase):
         self.assertEqual(self.text().count('===== 2026'), 1)
 
     def test_lock_timeout_queues_silently(self):
-        lock = self.root / '.lock'
-        lock.mkdir()
+        holder = hold(self.root)
         env = dict(os.environ, AI_HISTORY_DIR=str(self.root), AI_HISTORY_CODEX_SESSIONS=str(self.sessions))
         result = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(self.event('Stop', last_assistant_message='a')['input']), env=env, text=True, capture_output=True)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
-        self.assertTrue(lock.exists())
+        self.assertTrue(is_held(self.root))
         self.assertEqual(len(list(self.m.QUEUE.glob('*.json'))), 1)
         self.assertEqual(self.text(), '')
-        lock.rmdir()
+        release(holder)
         self.m.drain()
         self.assertEqual(len(list(self.m.QUEUE.glob('*.json'))), 0)
         self.assertIn('\na\n', self.text())
@@ -159,6 +161,19 @@ class CodexReviewTests(unittest.TestCase):
         self.assertEqual(self.text(), '')
         self.m.drain()
         self.assertIn('> preserve me\nfinal', self.text())
+
+    def test_orphan_event_dropped_after_a_day(self):
+        # Codex internal sessions never write a transcript; retrying them forever only spams .errors.
+        import datetime as dt
+        now = dt.datetime.now().astimezone()
+        for name, stamp in (('1-old', now - dt.timedelta(hours=30)), ('2-new', now)):
+            self.m.atomic(self.m.QUEUE / (name + '.json'), {'observed_at': stamp.isoformat(), 'input': dict(
+                hook_event_name='UserPromptSubmit', session_id='ghost-' + name, turn_id='t', prompt='x')})
+        self.m.drain()
+        self.assertTrue((self.m.DROPPED / '1-old.json').exists())
+        self.assertFalse((self.m.QUEUE / '1-old.json').exists())
+        self.assertTrue((self.m.QUEUE / '2-new.json').exists())
+        self.assertIn('dropped orphan event', (self.root / '.errors').read_text())
 
     def test_exhausted_budget_retains_queue_and_releases_lock(self):
         event = self.queue(1, 'Stop', last_assistant_message='final')

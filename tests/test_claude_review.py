@@ -16,6 +16,7 @@ COLLECTOR = REPO / 'bin/ai-history-claude'
 BACKFILL = REPO / 'scripts/backfill_claude.py'
 sys.path.insert(0, str(COLLECTOR.parent))
 from ai_history_common import Archive, atomic, key
+from _lock_helper import hold, release, is_held
 
 
 class ClaudeReview(unittest.TestCase):
@@ -63,10 +64,10 @@ class ClaudeReview(unittest.TestCase):
 
     def test_failed_stop_is_retried(self):
         self.hook('UserPromptSubmit', prompt='first')
-        lock = self.root / '.lock'; lock.mkdir()
+        holder = hold(self.root)
         self.hook('Stop', last_assistant_message='durable answer')
         self.assertTrue(list((self.root/'.pending/claude-events').glob('*.json')))
-        lock.rmdir()
+        release(holder)
         self.hook('UserPromptSubmit', prompt='next')
         self.assertIn('durable answer', self.text())
         self.hook('Stop', last_assistant_message='next answer')
@@ -74,13 +75,13 @@ class ClaudeReview(unittest.TestCase):
 
     def test_concurrent_duplicate_stop(self):
         self.hook('UserPromptSubmit', prompt='first')
-        lock=self.root/'.lock';lock.mkdir()
+        holder=hold(self.root)
         processes=[]
         for _ in range(2):
             p=subprocess.Popen([sys.executable,str(COLLECTOR)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.env,text=True)
             p.stdin.write(json.dumps(self.event('Stop',last_assistant_message='answer')));p.stdin.close()
             processes.append(p)
-        time.sleep(.2);lock.rmdir()
+        time.sleep(.2);release(holder)
         for p in processes:
             self.assertEqual(p.wait(),0)
             p.stdout.close();p.stderr.close()
@@ -133,13 +134,23 @@ class ClaudeReview(unittest.TestCase):
 
     def test_signal_releases_lock(self):
         # Termination while waiting retains a queued event and does not remove another owner's lock.
-        archive=Archive(self.root,'claude');archive.setup();lock=self.root/'.lock';lock.mkdir()
+        archive=Archive(self.root,'claude');archive.setup();holder=hold(self.root)
         p=subprocess.Popen([sys.executable,str(COLLECTOR)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.env,text=True)
         p.stdin.write(json.dumps(self.event('UserPromptSubmit',prompt='survive')));p.stdin.close()
         deadline=time.monotonic()+2
         while not list(archive.queue.glob('*.json')) and time.monotonic()<deadline:time.sleep(.01)
         p.terminate();self.assertEqual(p.wait(),0);p.stdout.close();p.stderr.close()
-        self.assertTrue(lock.exists());self.assertTrue(list(archive.queue.glob('*.json')))
+        self.assertTrue(is_held(self.root));self.assertTrue(list(archive.queue.glob('*.json')));release(holder)
+
+    def test_killed_holder_never_blocks_later_hooks(self):
+        # A hook killed with SIGKILL while owning the lock must not strand every later hook.
+        archive=Archive(self.root,'claude');archive.setup();holder=hold(self.root)
+        holder.kill();holder.wait();holder.stdout.close();holder.stdin.close()
+        self.hook('UserPromptSubmit',prompt='after kill')
+        self.hook('Stop',last_assistant_message='recorded')
+        self.assertIn('> after kill\nrecorded\n',self.text())
+        self.assertFalse((self.root/'.errors').exists())
+        self.assertFalse(list(archive.queue.glob('*.json')))
 
     def test_backfill_malformed_record_refuses_write(self):
         path=self.fixture()
