@@ -162,18 +162,39 @@ class CodexReviewTests(unittest.TestCase):
         self.m.drain()
         self.assertIn('> preserve me\nfinal', self.text())
 
+    def test_transcriptless_session_skipped_immediately(self):
+        # The Codex app's background suggestion task sends hooks with transcript_path=null
+        # and never writes a rollout file; there is nothing to record or retry.
+        for i, name in enumerate(('UserPromptSubmit', 'Stop', 'SessionEnd'), 1):
+            self.m.atomic(self.m.QUEUE / f'{i:03}.json', {'observed_at': '2026-11-17T01:02:18+09:00', 'input': dict(
+                hook_event_name=name, session_id='01a1e518-ghost', turn_id='t', prompt='x',
+                last_assistant_message='{}', transcript_path=None, cwd='/')})
+        self.m.drain()
+        self.assertEqual(list(self.m.QUEUE.glob('*.json')), [])
+        self.assertFalse((self.root / '.errors').exists())
+        self.assertEqual(self.text(), '')
+
     def test_orphan_event_dropped_after_a_day(self):
-        # Codex internal sessions never write a transcript; retrying them forever only spams .errors.
+        # A named transcript that never yields this session's metadata is retried, then dropped.
         import datetime as dt
         now = dt.datetime.now().astimezone()
         for name, stamp in (('1-old', now - dt.timedelta(hours=30)), ('2-new', now)):
             self.m.atomic(self.m.QUEUE / (name + '.json'), {'observed_at': stamp.isoformat(), 'input': dict(
-                hook_event_name='UserPromptSubmit', session_id='ghost-' + name, turn_id='t', prompt='x')})
+                hook_event_name='UserPromptSubmit', session_id='ghost-' + name, turn_id='t', prompt='x',
+                transcript_path=str(self.path))})
         self.m.drain()
         self.assertTrue((self.m.DROPPED / '1-old.json').exists())
         self.assertFalse((self.m.QUEUE / '1-old.json').exists())
         self.assertTrue((self.m.QUEUE / '2-new.json').exists())
         self.assertIn('dropped orphan event', (self.root / '.errors').read_text())
+
+    def test_null_transcript_path_still_found_by_session_id(self):
+        envelope = self.event('UserPromptSubmit', prompt='found by search')
+        envelope['input']['transcript_path'] = None
+        self.m.atomic(self.m.QUEUE / '001.json', envelope)
+        self.queue(2, 'Stop', last_assistant_message='answer')
+        self.m.drain()
+        self.assertIn('> found by search\nanswer', self.text())
 
     def test_exhausted_budget_retains_queue_and_releases_lock(self):
         event = self.queue(1, 'Stop', last_assistant_message='final')

@@ -123,6 +123,10 @@ def transcript(event):
         meta = metadata(path)
         if meta.get('id') == sid:
             return path, meta
+    if not candidate:
+        # Codex internal tasks (e.g. the app's suggestion generator) send
+        # transcript_path=null and never write a rollout file: nothing to record.
+        return None, None
     raise ValueError('session metadata unavailable; event retained')
 
 def rows_from_transcript(path, meta):
@@ -177,7 +181,7 @@ def process(envelope):
     if name not in ('UserPromptSubmit', 'Stop', 'Interrupt', 'SessionEnd'):
         return
     path, meta = transcript(event)
-    if not allowed(meta):
+    if meta is None or not allowed(meta):
         return
     sid = event['session_id']
     if name == 'SessionEnd':
