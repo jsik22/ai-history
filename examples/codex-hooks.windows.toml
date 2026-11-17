@@ -1,0 +1,12 @@
+# Windows: merge into %USERPROFILE%\.codex\config.toml; preserve notify and hooks.state.
+[[hooks.UserPromptSubmit]]
+hooks = [{ type = "command", command = 'python "C:/Users/<사용자>/.local/bin/ai-history-codex"', timeout = 5 }]
+
+[[hooks.Stop]]
+hooks = [{ type = "command", command = 'python "C:/Users/<사용자>/.local/bin/ai-history-codex"', timeout = 10 }]
+
+[[hooks.Interrupt]]
+hooks = [{ type = "command", command = 'python "C:/Users/<사용자>/.local/bin/ai-history-codex"', timeout = 3 }]
+
+[[hooks.SessionEnd]]
+hooks = [{ type = "command", command = 'python "C:/Users/<사용자>/.local/bin/ai-history-codex"', timeout = 3 }]

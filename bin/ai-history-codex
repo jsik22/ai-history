@@ -13,15 +13,16 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ai_history_common import Archive
+from ai_history_common import Archive, display_cwd, read_event
 
 os.umask(0o077)
 
 def terminate(signum, frame):
     raise SystemExit(0)
 
-signal.signal(signal.SIGTERM, terminate)
-signal.signal(signal.SIGHUP, terminate)
+for _name in ('SIGTERM', 'SIGHUP', 'SIGBREAK'):
+    if hasattr(signal, _name):
+        signal.signal(getattr(signal, _name), terminate)
 ROOT = Path(os.environ.get('AI_HISTORY_DIR', str(Path.home() / '.ai_history')))
 SESSIONS = Path(os.environ.get('AI_HISTORY_CODEX_SESSIONS', str(Path.home() / '.codex/sessions')))
 STATE = ROOT / '.codex-state'
@@ -72,10 +73,7 @@ def local_timestamp(value):
     return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d %H:%M:%S')
 
 def block(row):
-    cwd = row['cwd']
-    home = str(Path.home())
-    if cwd == home or cwd.startswith(home + '/'):
-        cwd = '~' + cwd[len(home):]
+    cwd = display_cwd(row['cwd'])
     prompt = row.get('prompt')
     prompt = '(이어서)' if prompt is None else prompt
     quoted = '\n'.join('> ' + line for line in prompt.split('\n'))
@@ -272,7 +270,7 @@ def drain(budget=None):
         DEADLINE = previous
 
 def hook():
-    envelope = {'observed_at': dt.datetime.now().astimezone().isoformat(), 'input': json.load(sys.stdin)}
+    envelope = {'observed_at': dt.datetime.now().astimezone().isoformat(), 'input': read_event()}
     atomic(QUEUE / (str(time.time_ns()) + '-' + uuid.uuid4().hex + '.json'), envelope)
     drain(budget=2.5)
 

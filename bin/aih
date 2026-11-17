@@ -68,6 +68,13 @@ def main(argv=None):
     parser.add_argument('-l', action='store_true', help='헤더와 프롬프트 첫 줄만 출력')
     parser.add_argument('keywords', nargs='*', help='모두 포함되어야 하는 문자열 (대소문자 무시)')
     args = parser.parse_args(argv)
+    if os.name == 'nt':
+        # A pipe on Windows uses the ANSI code page (e.g. cp949); one emoji in an
+        # archived answer must not abort the whole search. Raw blocks keep their
+        # own line endings instead of gaining \r.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(errors='replace', newline='\n')
     if not args.keywords and not (args.p or args.d or args.t) and args.n == 0:
         args.d = datetime.date.today().isoformat()
     root = Path(os.environ.get('AI_HISTORY_DIR') or str(Path.home() / '.ai_history'))

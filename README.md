@@ -2,7 +2,7 @@
 
 Claude Code와 Codex에서 사람이 나눈 **프롬프트와 최종 답변 원문**을 같은 형식으로 저장하고 검색하는 로컬 도구입니다.
 
-Python 3.9 이상 표준 라이브러리만 사용합니다. 별도 DB·서버·LLM API 호출이나 외부 전송이 없습니다. macOS에서 검증했으며 다른 운영체제는 아직 검증하지 않았습니다.
+Python 3.9 이상 표준 라이브러리만 사용합니다. 별도 DB·서버·LLM API 호출이나 외부 전송이 없습니다. macOS와 Windows에서 검증했습니다.
 
 ## 기록 흐름
 
@@ -42,7 +42,7 @@ flowchart TD
 | 도구 연동 | 명령 실행 훅이 전달하는 stdin JSON |
 | 과거 기록 입력 | Claude Code·Codex의 원본 JSONL |
 | 대화·내부 상태 저장 | 날짜별 Markdown, JSON 이벤트 큐·진행 상태·완료 식별자 |
-| 동시 쓰기 | 양쪽 수집기가 공유하는 `.lockfile`에 `fcntl.flock` 커널 잠금 획득; 보유 프로세스가 어떻게 죽든 자동 해제 |
+| 동시 쓰기 | 양쪽 수집기가 공유하는 `.lockfile`에 커널 잠금 획득(macOS `fcntl.flock`, Windows `msvcrt.locking`); 보유 프로세스가 어떻게 죽든 자동 해제 |
 | 실패 복구 | 트랜잭션 파일, `fsync`, `os.replace`를 이용한 상태 저장 |
 | 중복 방지 | 세션·턴 식별자와 SHA-256 기반 키; Claude는 확인 가능한 원본 UUID와 연결 |
 | 검색 | 정규식으로 블록 경계를 구분하고 문자열 조건으로 검색 |
@@ -62,6 +62,18 @@ chmod 600 "$HOME/.local/bin/ai_history_common.py"
 ```
 
 `~/.local/bin`을 PATH에 추가하고 `python3 --version`이 3.9 이상인지 확인합니다. 훅 프로세스에서도 Python을 찾을 수 있어야 합니다. 필요하면 설정의 `python3`를 해당 환경의 절대 경로로 지정하세요.
+
+### Windows
+
+PowerShell에서 저장소 루트로 이동해 실행합니다. `%USERPROFILE%\.local\bin`에 파일을 복사하고 사용자 PATH에 추가하며, 훅에 넣을 명령을 출력합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+`python --version`이 3.9 이상이어야 합니다. `aih`는 함께 설치되는 `aih.cmd`로 실행되므로 새 터미널(PowerShell·cmd)에서 바로 `aih`를 쓸 수 있습니다. 훅 설정은 [Claude 예시](examples/claude-hooks.windows.json)·[Codex 예시](examples/codex-hooks.windows.toml)의 `<사용자>`를 실제 사용자 이름으로 바꿔 병합합니다. 경로는 cmd·PowerShell·Git Bash 어디서 실행돼도 동작하도록 `/` 구분자의 절대 경로를 사용합니다.
+
+Windows에는 POSIX 권한이 없으므로 700/600 모드 대신 사용자 프로필 폴더의 ACL로 보호됩니다. 작업 디렉터리는 `~\projects\demo`처럼 원래 구분자를 유지해 기록합니다. `aih` 출력은 콘솔 코드 페이지로 표현할 수 없는 문자를 `?`로 바꾸며, 원문 그대로 받으려면 `PYTHONUTF8=1`을 설정하세요.
 
 ### Claude Code
 
@@ -123,7 +135,7 @@ python3 -m unittest discover -s tests -v
 ai-history-codex --drain
 ```
 
-테스트는 저장소 안의 코드를 대상으로 하며 실제 대화를 사용하지 않습니다. Python 3.9·3.14에서 정상 처리, 장애 복구, 원문 보존, 동시 쓰기와 재가져오기를 검증합니다.
+Windows에서는 테스트 전에 `$env:PYTHONUTF8 = '1'`을 설정합니다(테스트가 출력·픽스처를 UTF-8로 읽기 때문이며 수집기·`aih` 자체에는 필요 없습니다). 테스트는 저장소 안의 코드를 대상으로 하며 실제 대화를 사용하지 않습니다. macOS·Windows의 Python 3.9·3.14에서 정상 처리, 장애 복구, 원문 보존, 동시 쓰기와 재가져오기를 검증합니다.
 
 Codex 훅은 2.5초 작업 예산을 사용합니다. 큐에 남은 이벤트는 후속 훅 또는 `--drain`으로 재처리합니다. `--drain`은 미처리 이벤트가 남으면 종료 코드 1을 반환합니다. Claude의 보류 이벤트는 다음 훅에서 재시도합니다.
 

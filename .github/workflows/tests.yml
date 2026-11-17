@@ -4,15 +4,20 @@ permissions:
   contents: read
 jobs:
   unittest:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [macos-latest, windows-latest]
         python: ['3.9', '3.14']
     env:
       TZ: Asia/Seoul
+      # Tests decode subprocess output and fixtures as UTF-8; Windows defaults to the ANSI code page.
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - if: runner.os == 'Windows'
+        run: tzutil /s "Korea Standard Time"
       - run: python -m unittest discover -s tests -v

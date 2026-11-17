@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python \"C:/Users/<사용자>/.local/bin/ai-history-claude\""}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python \"C:/Users/<사용자>/.local/bin/ai-history-claude\""}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "python \"C:/Users/<사용자>/.local/bin/ai-history-claude\""}]}]
+  }
+}

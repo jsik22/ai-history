@@ -120,9 +120,10 @@ class StorageTests(unittest.TestCase):
         with self.codex.locked():
             self.codex.commit(row)
         self.assertIn(b'>  p\n> \n> \na\n\n\n\n', self.blocks())
-        path = next(self.root.glob('*/*.md'))
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.codex.queue.stat().st_mode & 0o777, 0o700)
+        if os.name != 'nt':  # Windows has no POSIX modes; profile ACLs apply.
+            path = next(self.root.glob('*/*.md'))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.codex.queue.stat().st_mode & 0o777, 0o700)
 
 if __name__ == '__main__':
     unittest.main()

@@ -3,6 +3,7 @@ import datetime
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,10 +30,10 @@ class AihTests(unittest.TestCase):
     def write(self, relative, text):
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding='utf-8')
+        path.write_bytes(text.encode('utf-8'))  # LF on every platform, like the collectors
 
     def query(self, *args):
-        return subprocess.run([str(AIH), *args], env={**os.environ, 'AI_HISTORY_DIR': str(self.root)}, capture_output=True, text=True)
+        return subprocess.run([sys.executable, str(AIH), *args], env={**os.environ, 'AI_HISTORY_DIR': str(self.root)}, capture_output=True, text=True)
 
     def good(self, args, expected):
         result = self.query(*args)
