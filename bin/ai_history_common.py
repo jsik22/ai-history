@@ -2,20 +2,74 @@
 import contextlib
 import datetime as dt
 import errno
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 import uuid
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
+
+BINARY = getattr(os, 'O_BINARY', 0)
+
+
+def try_lock(fd):
+    """Non-blocking exclusive lock; the OS releases it however the holder dies."""
+    try:
+        if os.name == 'nt':
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK):
+            return False
+        raise
+
+
+def unlock(fd):
+    if os.name == 'nt':
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def private(fd):
+    # Windows has no POSIX modes (and no os.fchmod before 3.13); ACLs of the
+    # user profile already keep the archive private there.
+    if os.name != 'nt':
+        os.fchmod(fd, 0o600)
+
+
+def read_event():
+    """Hook stdin is UTF-8 JSON; never decode it with the Windows ANSI code page."""
+    return json.loads(sys.stdin.buffer.read())
+
+
+def display_cwd(cwd):
+    home = str(Path.home())
+    if os.name == 'nt':
+        folded, base = os.path.normcase(cwd.replace('/', '\\')), os.path.normcase(home)
+        if folded == base or folded.startswith(base.rstrip('\\') + '\\'):
+            return '~' + cwd[len(home):]
+        return cwd
+    if cwd == home or cwd.startswith(home + '/'):
+        return '~' + cwd[len(home):]
+    return cwd
 
 def atomic(path, value):
     path = Path(path)
     temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | BINARY, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             json.dump(value, stream, ensure_ascii=False)
             stream.flush()
@@ -43,17 +97,14 @@ def local_timestamp(value=None):
 
 def error(root, message):
     with (Path(root) / '.errors').open('a', encoding='utf-8') as stream:
-        os.fchmod(stream.fileno(), 0o600)
+        private(stream.fileno())
         stream.write(f'{dt.datetime.now().isoformat()} {message}\n')
 
 def block(row, tool='codex'):
     timestamp = row['ts']
     if not re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d', timestamp):
         raise ValueError('invalid archive timestamp')
-    cwd = row['cwd']
-    home = str(Path.home())
-    if cwd == home or cwd.startswith(home + '/'):
-        cwd = '~' + cwd[len(home):]
+    cwd = display_cwd(row['cwd'])
     prompt = row.get('prompt')
     if prompt is None:
         prompt = '(이어서)'
@@ -102,22 +153,21 @@ class Archive:
                 stale.rmdir()
             except OSError:
                 pass
-        fd = os.open(self.root / '.lockfile', os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(self.root / '.lockfile', os.O_RDWR | os.O_CREAT | BINARY, 0o600)
+        held = False
         try:
             deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as exc:
-                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                        raise
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError('shared history lock timeout; event retained')
-                    time.sleep(min(.05, max(0, deadline - time.monotonic())))
+            while not try_lock(fd):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('shared history lock timeout; event retained')
+                time.sleep(min(.05, max(0, deadline - time.monotonic())))
+            held = True
             self.recover_all()
             yield
         finally:
+            if held:
+                # Windows may release a lock on close only lazily; drop it eagerly.
+                unlock(fd)
             os.close(fd)
 
     def recover(self):
@@ -139,7 +189,7 @@ class Archive:
             if target.stat().st_size != offset + len(actual) or not expected.startswith(actual):
                 raise RuntimeError('ambiguous append requires inspection; transaction preserved')
             with target.open('ab') as stream:
-                os.fchmod(stream.fileno(), 0o600)
+                private(stream.fileno())
                 stream.write(expected[len(actual):])
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -160,9 +210,9 @@ class Archive:
         if adopt_existing and path.exists() and content in path.read_bytes():
             atomic(self.state / 'done' / ident, {'sid': row['sid'], 'tid': row['tid']})
             return False
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | BINARY, 0o600)
         with os.fdopen(fd, 'ab') as stream:
-            os.fchmod(stream.fileno(), 0o600)
+            private(stream.fileno())
             offset = os.fstat(stream.fileno()).st_size
         atomic(self.state / 'transaction.json', {
             'relative_path': str(path.relative_to(self.root)), 'offset': offset,

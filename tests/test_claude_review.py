@@ -139,7 +139,9 @@ class ClaudeReview(unittest.TestCase):
         p.stdin.write(json.dumps(self.event('UserPromptSubmit',prompt='survive')));p.stdin.close()
         deadline=time.monotonic()+2
         while not list(archive.queue.glob('*.json')) and time.monotonic()<deadline:time.sleep(.01)
-        p.terminate();self.assertEqual(p.wait(),0);p.stdout.close();p.stderr.close()
+        # Windows terminate() is TerminateProcess: no handler runs, exit code is always 1.
+        p.terminate();code=p.wait();p.stdout.close();p.stderr.close()
+        if os.name!='nt':self.assertEqual(code,0)
         self.assertTrue(is_held(self.root));self.assertTrue(list(archive.queue.glob('*.json')));release(holder)
 
     def test_killed_holder_never_blocks_later_hooks(self):

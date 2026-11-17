@@ -50,8 +50,9 @@ class IntegrationTests(unittest.TestCase):
                                        env=env, text=True, capture_output=True)
                 self.assertEqual(query.returncode, 0)
                 self.assertEqual(query.stdout.count('===== '), 8)
-            for path in root.glob('*/*.md'):
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':  # Windows has no POSIX modes; profile ACLs apply.
+                for path in root.glob('*/*.md'):
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 if __name__ == '__main__':
     unittest.main()

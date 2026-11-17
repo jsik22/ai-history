@@ -64,7 +64,8 @@ class CodexReviewTests(unittest.TestCase):
         self.assertEqual(self.text(), expected)
         self.process('Stop', last_assistant_message='duplicate')
         self.assertEqual(self.text(), expected)
-        self.assertEqual(next(self.root.glob('*/*.md')).stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':  # Windows has no POSIX modes; profile ACLs apply.
+            self.assertEqual(next(self.root.glob('*/*.md')).stat().st_mode & 0o777, 0o600)
 
     def test_interrupt_and_session_end(self):
         self.process('UserPromptSubmit', prompt='prompt')

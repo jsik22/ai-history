@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ai_history_common import Archive, atomic, key, local_timestamp
+from ai_history_common import Archive, atomic, key, local_timestamp, read_event
 
 
 def load(path, default=None):
@@ -163,13 +163,14 @@ def main():
     os.umask(0o077)
     def interrupted(signum, frame):
         raise SystemExit('hook interrupted; queued event retained')
-    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(signum, interrupted)
+    for name in ('SIGTERM', 'SIGHUP', 'SIGINT', 'SIGBREAK'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupted)
     root = Path(os.environ.get('AI_HISTORY_DIR', str(Path.home() / '.ai_history')))
     try:
         if os.environ.get('CLAUDE_CODE_ENTRYPOINT', '').startswith('sdk'):
             return
-        event = json.load(sys.stdin)
+        event = read_event()
         if not isinstance(event, dict):
             return
         sid = event.get('session_id')
